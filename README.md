@@ -18,16 +18,34 @@ A Claude Code plugin that provides iTerm2 tab indicators and smart desktop notif
 
 ## Installation
 
-1. Clone or download this repository
-2. Run the install script:
+### Via Claude Code plugin marketplace
 
-```bash
-./scripts/install.sh
+1. Add the marketplace (if not already added):
+
+```
+/plugin marketplace add <marketplace-url>
 ```
 
-3. Restart iTerm2
+2. Install the plugin:
 
-The daemon starts automatically on every iTerm2 launch. No external dependencies are needed — everything runs inside iTerm2's bundled Python runtime.
+```
+/plugin
+```
+
+   Navigate to the **Discover** tab, find **cc-iterm2-notifier**, and install it.
+
+3. Restart iTerm2 (if it's already running)
+
+The plugin automatically sets up the iTerm2 daemon on your first Claude Code session after install. On every subsequent session start, it verifies the setup is still in place (fast no-op). No external dependencies — everything runs inside iTerm2's bundled Python runtime.
+
+### Manual installation
+
+If you prefer not to use the marketplace:
+
+1. Clone this repository
+2. Run `./scripts/install.sh`
+3. Add the plugin to Claude Code: `/plugin install <path-to-repo>`
+4. Restart iTerm2
 
 ## How It Works
 
@@ -70,6 +88,9 @@ All settings have sensible defaults. Optionally create `~/.config/cc-iterm2-noti
 ```
 
 ## Uninstall
+
+1. Remove the plugin from Claude Code: `/plugin` → select plugin → uninstall
+2. Remove the iTerm2 daemon symlink:
 
 ```bash
 ./scripts/install.sh --uninstall
