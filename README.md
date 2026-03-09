@@ -64,7 +64,6 @@ All settings have sensible defaults. Optionally create `~/.config/cc-iterm2-noti
 
 ```json
 {
-  "port": 19222,
   "notifications": {
     "delay_seconds": 5,
     "attention": {

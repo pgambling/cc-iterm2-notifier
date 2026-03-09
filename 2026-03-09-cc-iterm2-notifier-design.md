@@ -149,10 +149,12 @@ cc-iterm2-notifier/
 ├── .claude-plugin/
 │   └── plugin.json              # Plugin metadata
 ├── hooks/
-│   └── hooks.json               # Auto-installed HTTP hooks
+│   └── hooks.json               # Auto-installed hooks (SessionStart + HTTP)
 ├── scripts/
 │   ├── cc_iterm2_notifier.py    # iTerm2 AutoLaunch script (daemon)
-│   └── install.sh               # Symlinks daemon into iTerm2 AutoLaunch
+│   ├── init.sh                  # SessionStart hook: auto-symlinks daemon
+│   ├── register-session.sh      # SessionStart hook: writes TTY mapping
+│   └── install.sh               # Manual install/uninstall helper
 └── README.md
 ```
 
@@ -171,6 +173,14 @@ cc-iterm2-notifier/
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/init.sh" },
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/register-session.sh" }
+        ]
+      }
+    ],
     "Notification": [
       {
         "matcher": "idle_prompt|permission_prompt",

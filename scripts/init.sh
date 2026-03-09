@@ -25,6 +25,9 @@
         [[ "$target" == "$DAEMON_SRC" ]] && exit 0
     fi
 
+    # Daemon script must exist — don't create a dangling symlink
+    [[ -f "$DAEMON_SRC" ]] || exit 0
+
     # Set up: create dirs, place symlink
     mkdir -p "$AUTOLAUNCH_DIR"
     mkdir -p "$CONFIG_DIR"

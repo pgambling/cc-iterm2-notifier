@@ -98,7 +98,7 @@ CLAUDE_PLUGINS_DIR="$HOME/.claude/plugins"
 if [[ -d "$CLAUDE_PLUGINS_DIR" ]]; then
     for d in "$CLAUDE_PLUGINS_DIR"/*/; do
         if [[ -f "$d/.claude-plugin/plugin.json" ]]; then
-            name=$(python3 -c "import json; print(json.load(open('$d/.claude-plugin/plugin.json')).get('name',''))" 2>/dev/null || true)
+            name=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('name',''))" "$d/.claude-plugin/plugin.json" 2>/dev/null || true)
             if [[ "$name" == "$CONFLICT_PLUGIN" ]]; then
                 CONFLICT_FOUND=true
                 break

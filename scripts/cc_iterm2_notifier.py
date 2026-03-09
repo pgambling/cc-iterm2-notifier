@@ -10,8 +10,8 @@ Claude Code via HTTP POST to localhost:PORT/hook.
 import asyncio
 import json
 import math
-import os
 import pathlib
+import time
 import typing
 
 import iterm2
@@ -21,13 +21,13 @@ from aiohttp import web
 # Constants / defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_PORT = 19222
+PORT = 19222  # Fixed — must match the port in hooks.json
 DEFAULT_DELAY_SECONDS = 5
 CONFIG_DIR = pathlib.Path.home() / ".config" / "cc-iterm2-notifier"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+SESSIONS_DIR = CONFIG_DIR / "sessions"
 
 DEFAULT_CONFIG: dict = {
-    "port": DEFAULT_PORT,
     "notifications": {
         "delay_seconds": DEFAULT_DELAY_SECONDS,
         "attention": {
@@ -77,15 +77,14 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def load_config() -> dict:
     """Load configuration from disk, falling back to defaults."""
-    config = DEFAULT_CONFIG.copy()
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r") as f:
                 user_config = json.load(f)
-            config = _deep_merge(DEFAULT_CONFIG, user_config)
+            return _deep_merge(DEFAULT_CONFIG, user_config)
         except Exception as exc:
             print(f"cc-iterm2-notifier: failed to load config: {exc}")
-    return config
+    return DEFAULT_CONFIG.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +93,7 @@ def load_config() -> dict:
 
 
 def _color_from_dict(d: dict) -> iterm2.Color:
-    return iterm2.Color(d["r"], d["g"], d["b"])
+    return iterm2.Color(d.get("r", 0), d.get("g", 0), d.get("b", 0))
 
 
 def _color_distance(c1: iterm2.Color, c2: iterm2.Color) -> float:
@@ -243,7 +242,7 @@ class Notifier:
              identifier: typing.Optional[str] = None):
         """Send a desktop notification."""
         self._ensure_init()
-        if self._center is None:
+        if self._center is None or not self._authorized:
             return
         try:
             content = self._UNMutableNotificationContent.alloc().init()
@@ -298,6 +297,31 @@ class Controller:
         self.notifier = Notifier()
         self._config_mtime: typing.Optional[float] = None
         self._focus_monitor_task: typing.Optional[asyncio.Task] = None
+        self._last_cleanup = 0.0
+
+    # -- Housekeeping -------------------------------------------------------
+
+    def _cleanup_stale_sessions(self) -> None:
+        """Remove tracked sessions whose mapping files are older than 24h
+        or whose TTY no longer matches any open iTerm2 session."""
+        stale_keys = []
+        now = time.time()
+        for key in list(self.sessions):
+            mapping_file = SESSIONS_DIR / f"{key}.json"
+            try:
+                if mapping_file.exists():
+                    with open(mapping_file, "r") as f:
+                        data = json.load(f)
+                    ts = data.get("timestamp", 0)
+                    if now - ts > 86400:  # 24 hours
+                        stale_keys.append(key)
+                        mapping_file.unlink(missing_ok=True)
+                else:
+                    stale_keys.append(key)
+            except Exception:
+                stale_keys.append(key)
+        for key in stale_keys:
+            self.sessions.pop(key, None)
 
     # -- Config hot-reload --------------------------------------------------
 
@@ -310,6 +334,11 @@ class Controller:
                     self._config_mtime = mtime
         except Exception:
             pass
+        # Periodic stale session cleanup (every 10 minutes)
+        now = time.time()
+        if now - self._last_cleanup > 600:
+            self._last_cleanup = now
+            self._cleanup_stale_sessions()
 
     # -- Session lookup -----------------------------------------------------
 
@@ -318,32 +347,22 @@ class Controller:
             self.sessions[session_id] = SessionState(session_id)
         return self.sessions[session_id]
 
-    def _find_iterm_session(self, session_id: str) -> typing.Optional[iterm2.Session]:
-        """Find the iTerm2 session matching a Claude Code session_id.
+    def _resolve_tty(self, session_id: str) -> typing.Optional[str]:
+        """Look up the TTY for a Claude Code session_id from mapping files.
 
-        Claude Code sets the CLAUDE_CODE_SESSION_ID env var. We also match
-        against the active session in the current tab as a fallback using
-        the terminal's TTY.
+        The register-session.sh hook writes these files on SessionStart.
         """
-        # session_id from Claude Code hooks is the TTY path or an opaque id.
-        # We iterate all sessions and check the tty.
-        for window in self.app.windows:
-            for tab in window.tabs:
-                for session in tab.sessions:
-                    if session.session_id == session_id:
-                        return session
-        # Fallback: if session_id looks like a tty path, try matching by tty
-        for window in self.app.windows:
-            for tab in window.tabs:
-                for session in tab.sessions:
-                    try:
-                        if session.tty == session_id:
-                            return session
-                    except Exception:
-                        pass
+        mapping_file = SESSIONS_DIR / f"{session_id}.json"
+        try:
+            if mapping_file.exists():
+                with open(mapping_file, "r") as f:
+                    data = json.load(f)
+                return data.get("tty")
+        except Exception:
+            pass
         return None
 
-    def _find_iterm_session_for_tty(self, tty: str) -> typing.Optional[iterm2.Session]:
+    def _find_iterm_session_by_tty(self, tty: str) -> typing.Optional[iterm2.Session]:
         """Find an iTerm2 session by TTY path."""
         for window in self.app.windows:
             for tab in window.tabs:
@@ -355,6 +374,17 @@ class Controller:
                         pass
         return None
 
+    def _find_iterm_session(self, session_id: str) -> typing.Optional[iterm2.Session]:
+        """Find the iTerm2 session for a Claude Code session_id.
+
+        Uses the TTY mapping written by register-session.sh to bridge
+        Claude Code's opaque session_id to an iTerm2 terminal session.
+        """
+        tty = self._resolve_tty(session_id)
+        if tty:
+            return self._find_iterm_session_by_tty(tty)
+        return None
+
     # -- State transitions --------------------------------------------------
 
     async def handle_event(self, event: dict) -> None:
@@ -364,30 +394,22 @@ class Controller:
         hook_event = event.get("hook_event_name", "")
         notification_type = event.get("notification_type", "")
         session_id = event.get("session_id", "")
-        tty = event.get("tty", "")
-
-        # Determine the lookup key — prefer tty for matching iTerm sessions
-        lookup_key = tty or session_id
-        if not lookup_key:
+        if not session_id:
             return
 
         new_state = self._map_event_to_state(hook_event, notification_type)
         if new_state is None:
             return
 
-        ss = self._get_or_create(lookup_key)
+        ss = self._get_or_create(session_id)
         old_state = ss.state
 
         # Skip if already in this state
         if old_state == new_state:
             return
 
-        # Find the iTerm2 session
-        iterm_session = None
-        if tty:
-            iterm_session = self._find_iterm_session_for_tty(tty)
-        if iterm_session is None and session_id:
-            iterm_session = self._find_iterm_session(session_id)
+        # Find the iTerm2 session via TTY mapping
+        iterm_session = self._find_iterm_session(session_id)
 
         # Cancel any running flash/notification tasks
         await self._cancel_tasks(ss)
@@ -418,6 +440,14 @@ class Controller:
         indicators = self.config.get("tab_indicators", {})
         state_config = indicators.get(ss.state, {})
         profile = await session.async_get_profile()
+
+        # For idle/running: restore snapshot first, then apply minimal indicators
+        if ss.state in (STATE_IDLE, STATE_RUNNING) and ss.snapshot:
+            await ss.snapshot.restore(session)
+            # Re-fetch profile after restore since it may have changed
+            profile = await session.async_get_profile()
+            if ss.state == STATE_IDLE:
+                ss.snapshot = None
 
         # Set prefix on tab title
         prefix = state_config.get("prefix", "")
@@ -467,16 +497,6 @@ class Controller:
                 self._delayed_notification(ss, delay)
             )
 
-        # If transitioning to idle or running, restore snapshot if we have one
-        if ss.state in (STATE_IDLE, STATE_RUNNING) and ss.snapshot:
-            if ss.state == STATE_IDLE:
-                await ss.snapshot.restore(session)
-                # Re-apply idle prefix
-                base_title = ss.snapshot.title
-                idle_prefix = indicators.get("idle", {}).get("prefix", "")
-                await session.async_set_name(f"{idle_prefix}{base_title}")
-                ss.snapshot = None
-
     async def _flash_loop(
         self,
         ss: SessionState,
@@ -487,9 +507,9 @@ class Controller:
     ) -> None:
         """Alternate tab color between *color* and *original*."""
         show_color = True
+        profile = await session.async_get_profile()
         try:
             while True:
-                profile = await session.async_get_profile()
                 if show_color:
                     await profile.async_set_tab_color(color)
                 else:
@@ -548,21 +568,41 @@ class Controller:
                 pass
             ss.notification_task = None
 
-    async def handle_focus(self, session_id: str, focused: bool) -> None:
-        """Handle focus change for a session."""
-        # Find any tracked session matching this iTerm2 session
-        for key, ss in self.sessions.items():
-            iterm_session = self._find_iterm_session(session_id)
-            if iterm_session is None:
-                continue
-            # Check if this tracked session belongs to this iTerm session
-            tty_session = self._find_iterm_session_for_tty(key)
-            if tty_session and tty_session.session_id == session_id:
+    async def handle_focus(self, iterm_session_id: str, focused: bool) -> None:
+        """Handle focus change for an iTerm2 session.
+
+        Maps the focused iTerm2 session back to a tracked Claude Code session
+        by comparing TTYs.
+        """
+        # Get the TTY of the focused iTerm2 session
+        focused_session = None
+        for window in self.app.windows:
+            for tab in window.tabs:
+                for session in tab.sessions:
+                    if session.session_id == iterm_session_id:
+                        focused_session = session
+                        break
+        if focused_session is None:
+            return
+        try:
+            focused_tty = focused_session.tty
+        except Exception:
+            return
+
+        # Find which tracked Claude Code session maps to this TTY
+        for cc_session_id, ss in self.sessions.items():
+            tty = self._resolve_tty(cc_session_id)
+            if tty == focused_tty:
                 ss.focused = focused
                 if focused and ss.state in (STATE_ATTENTION, STATE_COMPLETED):
                     await self._cancel_tasks(ss)
-                    if ss.snapshot and iterm_session:
-                        await ss.snapshot.restore(iterm_session)
+                    if ss.snapshot:
+                        await ss.snapshot.restore(focused_session)
+                        # Re-apply idle prefix
+                        indicators = self.config.get("tab_indicators", {})
+                        idle_prefix = indicators.get("idle", {}).get("prefix", "")
+                        base_title = ss.snapshot.title
+                        await focused_session.async_set_name(f"{idle_prefix}{base_title}")
                         ss.snapshot = None
                     ss.state = STATE_IDLE
                 break
@@ -571,15 +611,12 @@ class Controller:
 
     async def start_focus_monitor(self) -> None:
         """Monitor iTerm2 focus changes and dismiss alerts when tab is focused."""
-        try:
-            async with iterm2.FocusMonitor(self.connection) as monitor:
-                while True:
-                    update = await monitor.async_get_next_update()
-                    if update.active_session_changed:
-                        session_id = update.active_session_changed.session_id
-                        await self.handle_focus(session_id, True)
-        except Exception as exc:
-            print(f"cc-iterm2-notifier: focus monitor error: {exc}")
+        async with iterm2.FocusMonitor(self.connection) as monitor:
+            while True:
+                update = await monitor.async_get_next_update()
+                if update.active_session_changed:
+                    session_id = update.active_session_changed.session_id
+                    await self.handle_focus(session_id, True)
 
     # -- HTTP Server --------------------------------------------------------
 
@@ -589,12 +626,18 @@ class Controller:
         app.router.add_post("/hook", self._handle_hook_request)
         app.router.add_get("/health", self._handle_health)
 
-        port = self.config.get("port", DEFAULT_PORT)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", port)
-        await site.start()
-        print(f"cc-iterm2-notifier: listening on http://127.0.0.1:{port}")
+        site = web.TCPSite(runner, "127.0.0.1", PORT)
+        try:
+            await site.start()
+        except OSError as exc:
+            if exc.errno == 48:  # Address already in use
+                print(f"cc-iterm2-notifier: port {PORT} already in use — "
+                      "another instance may be running. Exiting.")
+                return
+            raise
+        print(f"cc-iterm2-notifier: listening on http://127.0.0.1:{PORT}")
 
     async def _handle_hook_request(self, request: web.Request) -> web.Response:
         try:
@@ -602,8 +645,17 @@ class Controller:
         except Exception:
             return web.json_response({"error": "invalid json"}, status=400)
 
-        asyncio.ensure_future(self.handle_event(body))
+        task = asyncio.ensure_future(self.handle_event(body))
+        task.add_done_callback(self._log_task_exception)
         return web.json_response({"status": "ok"})
+
+    @staticmethod
+    def _log_task_exception(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            print(f"cc-iterm2-notifier: event handler error: {exc}")
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({
@@ -621,11 +673,17 @@ async def main(connection: iterm2.Connection):
     app = await iterm2.async_get_app(connection)
     controller = Controller(app, connection)
 
-    # Start HTTP server and focus monitor concurrently
-    await asyncio.gather(
-        controller.start_server(),
-        controller.start_focus_monitor(),
-    )
+    # Start HTTP server first — it must be ready before hooks arrive
+    await controller.start_server()
+
+    # Focus monitor runs forever; restart it on failure so a transient
+    # iTerm2 API error doesn't kill the entire daemon.
+    while True:
+        try:
+            await controller.start_focus_monitor()
+        except Exception as exc:
+            print(f"cc-iterm2-notifier: focus monitor crashed, restarting: {exc}")
+            await asyncio.sleep(2)
 
 
 iterm2.run_forever(main)
