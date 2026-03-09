@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""
+cc-iterm2-notifier — iTerm2 AutoLaunch script that provides tab indicators
+and smart desktop notifications for Claude Code sessions.
+
+Runs as a daemon inside iTerm2's Python runtime. Receives hook events from
+Claude Code via HTTP POST to localhost:PORT/hook.
+"""
+
+import asyncio
+import json
+import math
+import os
+import pathlib
+import typing
+
+import iterm2
+from aiohttp import web
+
+# ---------------------------------------------------------------------------
+# Constants / defaults
+# ---------------------------------------------------------------------------
+
+DEFAULT_PORT = 19222
+DEFAULT_DELAY_SECONDS = 5
+CONFIG_DIR = pathlib.Path.home() / ".config" / "cc-iterm2-notifier"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG: dict = {
+    "port": DEFAULT_PORT,
+    "notifications": {
+        "delay_seconds": DEFAULT_DELAY_SECONDS,
+        "attention": {
+            "sound": "Ping",
+            "title": "Claude Code: Permission Required",
+            "message": "Claude needs approval to proceed.",
+        },
+        "completed": {
+            "sound": "default",
+            "title": "Claude Code: Task Completed",
+            "message": "The requested task has been finished.",
+        },
+    },
+    "tab_indicators": {
+        "running": {"prefix": "⚡ ", "color": {"r": 59, "g": 130, "b": 246}},
+        "idle": {"prefix": "💤 "},
+        "attention": {
+            "prefix": "🔴 ",
+            "color": {"r": 239, "g": 68, "b": 68},
+            "flash_interval": 0.6,
+            "badge": "⚠️ Needs input",
+        },
+        "completed": {
+            "prefix": "✅ ",
+            "color": {"r": 34, "g": 197, "b": 94},
+            "flash_interval": 1.2,
+            "badge": "Review ready",
+        },
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base*, returning a new dict."""
+    merged = base.copy()
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_config() -> dict:
+    """Load configuration from disk, falling back to defaults."""
+    config = DEFAULT_CONFIG.copy()
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                user_config = json.load(f)
+            config = _deep_merge(DEFAULT_CONFIG, user_config)
+        except Exception as exc:
+            print(f"cc-iterm2-notifier: failed to load config: {exc}")
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Color helpers
+# ---------------------------------------------------------------------------
+
+
+def _color_from_dict(d: dict) -> iterm2.Color:
+    return iterm2.Color(d["r"], d["g"], d["b"])
+
+
+def _color_distance(c1: iterm2.Color, c2: iterm2.Color) -> float:
+    """Simple Euclidean distance in RGB space."""
+    return math.sqrt(
+        (c1.red - c2.red) ** 2
+        + (c1.green - c2.green) ** 2
+        + (c1.blue - c2.blue) ** 2
+    )
+
+
+def auto_contrast(target: iterm2.Color, background: iterm2.Color) -> iterm2.Color:
+    """If *target* is too close to *background*, pick a fallback."""
+    if _color_distance(target, background) > 80:
+        return target
+    # Try blue, white, then inverted
+    fallbacks = [
+        iterm2.Color(59, 130, 246),
+        iterm2.Color(255, 255, 255),
+        iterm2.Color(255 - background.red, 255 - background.green, 255 - background.blue),
+    ]
+    for fb in fallbacks:
+        if _color_distance(fb, background) > 80:
+            return fb
+    return fallbacks[-1]
+
+
+# ---------------------------------------------------------------------------
+# Tab Snapshot — captures original tab state for clean restore
+# ---------------------------------------------------------------------------
+
+
+class TabSnapshot:
+    """Stores the original tab state so it can be restored later."""
+
+    __slots__ = ("title", "tab_color", "badge")
+
+    def __init__(self, title: str, tab_color: typing.Optional[iterm2.Color], badge: str):
+        self.title = title
+        self.tab_color = tab_color
+        self.badge = badge
+
+    @classmethod
+    async def capture(cls, session: iterm2.Session) -> "TabSnapshot":
+        profile = await session.async_get_profile()
+        tab_color = None
+        if await _profile_uses_tab_color(profile):
+            tab_color = profile.tab_color
+        title = session.name or ""
+        badge = profile.badge_text or ""
+        return cls(title=title, tab_color=tab_color, badge=badge)
+
+    async def restore(self, session: iterm2.Session) -> None:
+        profile = await session.async_get_profile()
+        # Restore badge
+        await profile.async_set_badge_text(self.badge)
+        # Restore tab color
+        if self.tab_color is not None:
+            await profile.async_set_tab_color(self.tab_color)
+            await profile.async_set_use_tab_color(True)
+        else:
+            await profile.async_set_use_tab_color(False)
+        # Restore title — strip any prefix we may have added
+        await session.async_set_name(self.title)
+
+
+async def _profile_uses_tab_color(profile) -> bool:
+    try:
+        return profile.use_tab_color
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Session State
+# ---------------------------------------------------------------------------
+
+# States
+STATE_IDLE = "idle"
+STATE_RUNNING = "running"
+STATE_ATTENTION = "attention"
+STATE_COMPLETED = "completed"
+
+
+class SessionState:
+    """Tracks state for a single Claude Code session (identified by session_id)."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.state = STATE_IDLE
+        self.snapshot: typing.Optional[TabSnapshot] = None
+        self.flash_task: typing.Optional[asyncio.Task] = None
+        self.notification_task: typing.Optional[asyncio.Task] = None
+        self.focused = False
+
+
+# ---------------------------------------------------------------------------
+# Notifier — native macOS notifications via pyobjc
+# ---------------------------------------------------------------------------
+
+
+class Notifier:
+    """Sends native macOS desktop notifications using UNUserNotificationCenter."""
+
+    def __init__(self):
+        self._center = None
+        self._authorized = False
+        self._init_attempted = False
+
+    def _ensure_init(self):
+        if self._init_attempted:
+            return
+        self._init_attempted = True
+        try:
+            import Foundation
+            import UserNotifications
+
+            self._UNUserNotificationCenter = UserNotifications.UNUserNotificationCenter
+            self._UNMutableNotificationContent = UserNotifications.UNMutableNotificationContent
+            self._UNNotificationRequest = UserNotifications.UNNotificationRequest
+            self._UNTimeIntervalNotificationTrigger = UserNotifications.UNTimeIntervalNotificationTrigger
+            self._UNNotificationSound = UserNotifications.UNNotificationSound
+            self._NSUUID = Foundation.NSUUID
+
+            self._center = self._UNUserNotificationCenter.currentNotificationCenter()
+            self._request_authorization()
+        except ImportError:
+            print("cc-iterm2-notifier: pyobjc UserNotifications not available, "
+                  "desktop notifications disabled")
+        except Exception as exc:
+            print(f"cc-iterm2-notifier: notification init failed: {exc}")
+
+    def _request_authorization(self):
+        if self._center is None:
+            return
+        try:
+            # Request alert + sound permissions
+            self._center.requestAuthorizationWithOptions_completionHandler_(
+                0x04 | 0x02 | 0x01,  # badge | sound | alert
+                lambda granted, error: setattr(self, "_authorized", granted),
+            )
+        except Exception as exc:
+            print(f"cc-iterm2-notifier: authorization request failed: {exc}")
+
+    def send(self, title: str, message: str, sound: str = "default",
+             identifier: typing.Optional[str] = None):
+        """Send a desktop notification."""
+        self._ensure_init()
+        if self._center is None:
+            return
+        try:
+            content = self._UNMutableNotificationContent.alloc().init()
+            content.setTitle_(title)
+            content.setBody_(message)
+
+            if sound and sound != "none":
+                if sound == "default":
+                    content.setSound_(self._UNNotificationSound.defaultSound())
+                else:
+                    content.setSound_(
+                        self._UNNotificationSound.soundNamed_(sound)
+                    )
+
+            req_id = identifier or self._NSUUID.UUID().UUIDString()
+            trigger = self._UNTimeIntervalNotificationTrigger.triggerWithTimeInterval_repeats_(
+                0.1, False
+            )
+            request = self._UNNotificationRequest.requestWithIdentifier_content_trigger_(
+                req_id, content, trigger
+            )
+            self._center.addNotificationRequest_withCompletionHandler_(
+                request, lambda error: None
+            )
+        except Exception as exc:
+            print(f"cc-iterm2-notifier: failed to send notification: {exc}")
+
+    def cancel(self, identifier: str):
+        """Cancel a pending notification by identifier."""
+        self._ensure_init()
+        if self._center is None:
+            return
+        try:
+            self._center.removePendingNotificationRequestsWithIdentifiers_([identifier])
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main Controller
+# ---------------------------------------------------------------------------
+
+
+class Controller:
+    """Orchestrates state management, iTerm2 tab updates, and notifications."""
+
+    def __init__(self, app: iterm2.App, connection: iterm2.Connection):
+        self.app = app
+        self.connection = connection
+        self.config = load_config()
+        self.sessions: dict[str, SessionState] = {}
+        self.notifier = Notifier()
+        self._config_mtime: typing.Optional[float] = None
+        self._focus_monitor_task: typing.Optional[asyncio.Task] = None
+
+    # -- Config hot-reload --------------------------------------------------
+
+    def _maybe_reload_config(self):
+        try:
+            if CONFIG_FILE.exists():
+                mtime = CONFIG_FILE.stat().st_mtime
+                if self._config_mtime is None or mtime > self._config_mtime:
+                    self.config = load_config()
+                    self._config_mtime = mtime
+        except Exception:
+            pass
+
+    # -- Session lookup -----------------------------------------------------
+
+    def _get_or_create(self, session_id: str) -> SessionState:
+        if session_id not in self.sessions:
+            self.sessions[session_id] = SessionState(session_id)
+        return self.sessions[session_id]
+
+    def _find_iterm_session(self, session_id: str) -> typing.Optional[iterm2.Session]:
+        """Find the iTerm2 session matching a Claude Code session_id.
+
+        Claude Code sets the CLAUDE_CODE_SESSION_ID env var. We also match
+        against the active session in the current tab as a fallback using
+        the terminal's TTY.
+        """
+        # session_id from Claude Code hooks is the TTY path or an opaque id.
+        # We iterate all sessions and check the tty.
+        for window in self.app.windows:
+            for tab in window.tabs:
+                for session in tab.sessions:
+                    if session.session_id == session_id:
+                        return session
+        # Fallback: if session_id looks like a tty path, try matching by tty
+        for window in self.app.windows:
+            for tab in window.tabs:
+                for session in tab.sessions:
+                    try:
+                        if session.tty == session_id:
+                            return session
+                    except Exception:
+                        pass
+        return None
+
+    def _find_iterm_session_for_tty(self, tty: str) -> typing.Optional[iterm2.Session]:
+        """Find an iTerm2 session by TTY path."""
+        for window in self.app.windows:
+            for tab in window.tabs:
+                for session in tab.sessions:
+                    try:
+                        if session.tty == tty:
+                            return session
+                    except Exception:
+                        pass
+        return None
+
+    # -- State transitions --------------------------------------------------
+
+    async def handle_event(self, event: dict) -> None:
+        """Process an incoming hook event from Claude Code."""
+        self._maybe_reload_config()
+
+        hook_event = event.get("hook_event_name", "")
+        notification_type = event.get("notification_type", "")
+        session_id = event.get("session_id", "")
+        tty = event.get("tty", "")
+
+        # Determine the lookup key — prefer tty for matching iTerm sessions
+        lookup_key = tty or session_id
+        if not lookup_key:
+            return
+
+        new_state = self._map_event_to_state(hook_event, notification_type)
+        if new_state is None:
+            return
+
+        ss = self._get_or_create(lookup_key)
+        old_state = ss.state
+
+        # Skip if already in this state
+        if old_state == new_state:
+            return
+
+        # Find the iTerm2 session
+        iterm_session = None
+        if tty:
+            iterm_session = self._find_iterm_session_for_tty(tty)
+        if iterm_session is None and session_id:
+            iterm_session = self._find_iterm_session(session_id)
+
+        # Cancel any running flash/notification tasks
+        await self._cancel_tasks(ss)
+
+        # Capture snapshot on first non-idle transition
+        if iterm_session and ss.snapshot is None and new_state != STATE_IDLE:
+            ss.snapshot = await TabSnapshot.capture(iterm_session)
+
+        ss.state = new_state
+
+        if iterm_session:
+            await self._apply_state(ss, iterm_session)
+
+    def _map_event_to_state(self, hook_event: str, notification_type: str) -> typing.Optional[str]:
+        if hook_event == "UserPromptSubmit":
+            return STATE_RUNNING
+        elif hook_event == "Stop":
+            return STATE_COMPLETED
+        elif hook_event == "Notification":
+            if notification_type == "idle_prompt":
+                return STATE_IDLE
+            elif notification_type == "permission_prompt":
+                return STATE_ATTENTION
+        return None
+
+    async def _apply_state(self, ss: SessionState, session: iterm2.Session) -> None:
+        """Apply visual indicators for the current state."""
+        indicators = self.config.get("tab_indicators", {})
+        state_config = indicators.get(ss.state, {})
+        profile = await session.async_get_profile()
+
+        # Set prefix on tab title
+        prefix = state_config.get("prefix", "")
+        base_title = ss.snapshot.title if ss.snapshot else (session.name or "")
+        # Strip any existing prefix (look for known prefixes)
+        for s in indicators.values():
+            p = s.get("prefix", "")
+            if p and base_title.startswith(p):
+                base_title = base_title[len(p):]
+                break
+        await session.async_set_name(f"{prefix}{base_title}")
+
+        # Set badge
+        badge = state_config.get("badge", "")
+        await profile.async_set_badge_text(badge)
+
+        # Set tab color
+        color_dict = state_config.get("color")
+        flash_interval = state_config.get("flash_interval")
+
+        if color_dict:
+            target_color = _color_from_dict(color_dict)
+            bg_color = ss.snapshot.tab_color if (ss.snapshot and ss.snapshot.tab_color) else iterm2.Color(0, 0, 0)
+            target_color = auto_contrast(target_color, bg_color)
+
+            if flash_interval:
+                # Start flash/pulse task
+                ss.flash_task = asyncio.ensure_future(
+                    self._flash_loop(ss, session, target_color, bg_color, flash_interval)
+                )
+            else:
+                # Steady color
+                await profile.async_set_tab_color(target_color)
+                await profile.async_set_use_tab_color(True)
+        else:
+            # Restore original color (idle state)
+            if ss.snapshot and ss.snapshot.tab_color:
+                await profile.async_set_tab_color(ss.snapshot.tab_color)
+                await profile.async_set_use_tab_color(True)
+            else:
+                await profile.async_set_use_tab_color(False)
+
+        # Schedule desktop notification for attention/completed
+        if ss.state in (STATE_ATTENTION, STATE_COMPLETED):
+            delay = self.config.get("notifications", {}).get("delay_seconds", DEFAULT_DELAY_SECONDS)
+            ss.notification_task = asyncio.ensure_future(
+                self._delayed_notification(ss, delay)
+            )
+
+        # If transitioning to idle or running, restore snapshot if we have one
+        if ss.state in (STATE_IDLE, STATE_RUNNING) and ss.snapshot:
+            if ss.state == STATE_IDLE:
+                await ss.snapshot.restore(session)
+                # Re-apply idle prefix
+                base_title = ss.snapshot.title
+                idle_prefix = indicators.get("idle", {}).get("prefix", "")
+                await session.async_set_name(f"{idle_prefix}{base_title}")
+                ss.snapshot = None
+
+    async def _flash_loop(
+        self,
+        ss: SessionState,
+        session: iterm2.Session,
+        color: iterm2.Color,
+        original: iterm2.Color,
+        interval: float,
+    ) -> None:
+        """Alternate tab color between *color* and *original*."""
+        show_color = True
+        try:
+            while True:
+                profile = await session.async_get_profile()
+                if show_color:
+                    await profile.async_set_tab_color(color)
+                else:
+                    if original:
+                        await profile.async_set_tab_color(original)
+                    else:
+                        await profile.async_set_use_tab_color(False)
+                        await asyncio.sleep(interval)
+                        await profile.async_set_use_tab_color(True)
+                        show_color = not show_color
+                        continue
+                await profile.async_set_use_tab_color(True)
+                show_color = not show_color
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"cc-iterm2-notifier: flash loop error: {exc}")
+
+    async def _delayed_notification(self, ss: SessionState, delay: float) -> None:
+        """Wait *delay* seconds, then send a desktop notification if still relevant."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
+        if ss.state not in (STATE_ATTENTION, STATE_COMPLETED):
+            return
+
+        if ss.focused:
+            return
+
+        notif_config = self.config.get("notifications", {}).get(ss.state, {})
+        title = notif_config.get("title", f"Claude Code: {ss.state}")
+        message = notif_config.get("message", "")
+        sound = notif_config.get("sound", "default")
+        notif_id = f"cc-iterm2-{ss.session_id}-{ss.state}"
+
+        self.notifier.send(title=title, message=message, sound=sound, identifier=notif_id)
+
+    async def _cancel_tasks(self, ss: SessionState) -> None:
+        """Cancel running flash and notification tasks."""
+        if ss.flash_task and not ss.flash_task.done():
+            ss.flash_task.cancel()
+            try:
+                await ss.flash_task
+            except asyncio.CancelledError:
+                pass
+            ss.flash_task = None
+
+        if ss.notification_task and not ss.notification_task.done():
+            ss.notification_task.cancel()
+            try:
+                await ss.notification_task
+            except asyncio.CancelledError:
+                pass
+            ss.notification_task = None
+
+    async def handle_focus(self, session_id: str, focused: bool) -> None:
+        """Handle focus change for a session."""
+        # Find any tracked session matching this iTerm2 session
+        for key, ss in self.sessions.items():
+            iterm_session = self._find_iterm_session(session_id)
+            if iterm_session is None:
+                continue
+            # Check if this tracked session belongs to this iTerm session
+            tty_session = self._find_iterm_session_for_tty(key)
+            if tty_session and tty_session.session_id == session_id:
+                ss.focused = focused
+                if focused and ss.state in (STATE_ATTENTION, STATE_COMPLETED):
+                    await self._cancel_tasks(ss)
+                    if ss.snapshot and iterm_session:
+                        await ss.snapshot.restore(iterm_session)
+                        ss.snapshot = None
+                    ss.state = STATE_IDLE
+                break
+
+    # -- Focus monitor ------------------------------------------------------
+
+    async def start_focus_monitor(self) -> None:
+        """Monitor iTerm2 focus changes and dismiss alerts when tab is focused."""
+        try:
+            async with iterm2.FocusMonitor(self.connection) as monitor:
+                while True:
+                    update = await monitor.async_get_next_update()
+                    if update.active_session_changed:
+                        session_id = update.active_session_changed.session_id
+                        await self.handle_focus(session_id, True)
+        except Exception as exc:
+            print(f"cc-iterm2-notifier: focus monitor error: {exc}")
+
+    # -- HTTP Server --------------------------------------------------------
+
+    async def start_server(self) -> None:
+        """Start the HTTP server to receive hook events."""
+        app = web.Application()
+        app.router.add_post("/hook", self._handle_hook_request)
+        app.router.add_get("/health", self._handle_health)
+
+        port = self.config.get("port", DEFAULT_PORT)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", port)
+        await site.start()
+        print(f"cc-iterm2-notifier: listening on http://127.0.0.1:{port}")
+
+    async def _handle_hook_request(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+
+        asyncio.ensure_future(self.handle_event(body))
+        return web.json_response({"status": "ok"})
+
+    async def _handle_health(self, request: web.Request) -> web.Response:
+        return web.json_response({
+            "status": "healthy",
+            "sessions": len(self.sessions),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Entry point — iTerm2 AutoLaunch
+# ---------------------------------------------------------------------------
+
+
+async def main(connection: iterm2.Connection):
+    app = await iterm2.async_get_app(connection)
+    controller = Controller(app, connection)
+
+    # Start HTTP server and focus monitor concurrently
+    await asyncio.gather(
+        controller.start_server(),
+        controller.start_focus_monitor(),
+    )
+
+
+iterm2.run_forever(main)
