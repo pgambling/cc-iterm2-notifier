@@ -8,6 +8,7 @@ Claude Code via HTTP POST to localhost:PORT/hook.
 """
 
 import asyncio
+import errno
 import json
 import math
 import pathlib
@@ -84,7 +85,7 @@ def load_config() -> dict:
             return _deep_merge(DEFAULT_CONFIG, user_config)
         except Exception as exc:
             print(f"cc-iterm2-notifier: failed to load config: {exc}")
-    return DEFAULT_CONFIG.copy()
+    return _deep_merge(DEFAULT_CONFIG, {})
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +201,7 @@ class Notifier:
 
     def __init__(self):
         self._center = None
+        self._auth_resolved = False  # True once the OS callback fires
         self._authorized = False
         self._init_attempted = False
 
@@ -233,7 +235,10 @@ class Notifier:
             # Request alert + sound permissions
             self._center.requestAuthorizationWithOptions_completionHandler_(
                 0x04 | 0x02 | 0x01,  # badge | sound | alert
-                lambda granted, error: setattr(self, "_authorized", granted),
+                lambda granted, error: (
+                    setattr(self, "_authorized", granted),
+                    setattr(self, "_auth_resolved", True),
+                ),
             )
         except Exception as exc:
             print(f"cc-iterm2-notifier: authorization request failed: {exc}")
@@ -242,7 +247,11 @@ class Notifier:
              identifier: typing.Optional[str] = None):
         """Send a desktop notification."""
         self._ensure_init()
-        if self._center is None or not self._authorized:
+        if self._center is None:
+            return
+        # If authorization hasn't resolved yet, optimistically try sending.
+        # If explicitly denied, skip.
+        if self._auth_resolved and not self._authorized:
             return
         try:
             content = self._UNMutableNotificationContent.alloc().init()
@@ -298,6 +307,7 @@ class Controller:
         self._config_mtime: typing.Optional[float] = None
         self._focus_monitor_task: typing.Optional[asyncio.Task] = None
         self._last_cleanup = 0.0
+        self._tty_cache: dict[str, str] = {}  # session_id → tty
 
     # -- Housekeeping -------------------------------------------------------
 
@@ -322,6 +332,7 @@ class Controller:
                 stale_keys.append(key)
         for key in stale_keys:
             self.sessions.pop(key, None)
+            self._tty_cache.pop(key, None)
 
     # -- Config hot-reload --------------------------------------------------
 
@@ -351,13 +362,19 @@ class Controller:
         """Look up the TTY for a Claude Code session_id from mapping files.
 
         The register-session.sh hook writes these files on SessionStart.
+        Results are cached in memory to avoid repeated file I/O.
         """
+        if session_id in self._tty_cache:
+            return self._tty_cache[session_id]
         mapping_file = SESSIONS_DIR / f"{session_id}.json"
         try:
             if mapping_file.exists():
                 with open(mapping_file, "r") as f:
                     data = json.load(f)
-                return data.get("tty")
+                tty = data.get("tty")
+                if tty:
+                    self._tty_cache[session_id] = tty
+                return tty
         except Exception:
             pass
         return None
@@ -620,8 +637,8 @@ class Controller:
 
     # -- HTTP Server --------------------------------------------------------
 
-    async def start_server(self) -> None:
-        """Start the HTTP server to receive hook events."""
+    async def start_server(self) -> bool:
+        """Start the HTTP server. Returns True on success, False on failure."""
         app = web.Application()
         app.router.add_post("/hook", self._handle_hook_request)
         app.router.add_get("/health", self._handle_health)
@@ -632,12 +649,13 @@ class Controller:
         try:
             await site.start()
         except OSError as exc:
-            if exc.errno == 48:  # Address already in use
+            if exc.errno == errno.EADDRINUSE:
                 print(f"cc-iterm2-notifier: port {PORT} already in use — "
                       "another instance may be running. Exiting.")
-                return
+                return False
             raise
         print(f"cc-iterm2-notifier: listening on http://127.0.0.1:{PORT}")
+        return True
 
     async def _handle_hook_request(self, request: web.Request) -> web.Response:
         try:
@@ -674,7 +692,8 @@ async def main(connection: iterm2.Connection):
     controller = Controller(app, connection)
 
     # Start HTTP server first — it must be ready before hooks arrive
-    await controller.start_server()
+    if not await controller.start_server():
+        return
 
     # Focus monitor runs forever; restart it on failure so a transient
     # iTerm2 API error doesn't kill the entire daemon.

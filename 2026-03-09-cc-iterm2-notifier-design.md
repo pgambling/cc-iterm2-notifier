@@ -108,7 +108,6 @@ Single config file at `~/.config/cc-iterm2-notifier/config.json`, hot-reloaded o
 
 ```json
 {
-  "port": 19222,
   "notifications": {
     "delay_seconds": 5,
     "attention": {
