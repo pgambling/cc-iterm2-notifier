@@ -23,16 +23,14 @@ A Claude Code plugin that provides iTerm2 tab indicators and smart desktop notif
 1. Add the marketplace (if not already added):
 
 ```
-/plugin marketplace add <marketplace-url>
+/plugin marketplace add pgambling/cc-iterm2-notifier
 ```
 
 2. Install the plugin:
 
 ```
-/plugin
+/plugin install cc-iterm2-notifier
 ```
-
-   Navigate to the **Discover** tab, find **cc-iterm2-notifier**, and install it.
 
 3. Restart iTerm2 (if it's already running)
 

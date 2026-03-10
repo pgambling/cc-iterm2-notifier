@@ -1,5 +1,12 @@
 {
   "name": "cc-iterm2-notifier",
   "description": "iTerm2 tab indicators and smart notifications for Claude Code",
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "author": {
+    "name": "Phil Gambling"
+  },
+  "homepage": "https://github.com/pgambling/cc-iterm2-notifier",
+  "repository": "pgambling/cc-iterm2-notifier",
+  "license": "MIT",
+  "keywords": ["iterm2", "notifications", "macos", "tab-indicators"]
 }

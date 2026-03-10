@@ -1,0 +1,22 @@
+{
+  "name": "cc-iterm2-notifier-marketplace",
+  "owner": {
+    "name": "Phil Gambling"
+  },
+  "metadata": {
+    "description": "Plugin marketplace for cc-iterm2-notifier"
+  },
+  "plugins": [
+    {
+      "name": "cc-iterm2-notifier",
+      "source": ".",
+      "description": "iTerm2 tab indicators and smart notifications for Claude Code",
+      "version": "0.1.0",
+      "author": {
+        "name": "Phil Gambling"
+      },
+      "license": "MIT",
+      "keywords": ["iterm2", "notifications", "macos", "tab-indicators"]
+    }
+  ]
+}
