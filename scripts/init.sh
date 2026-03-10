@@ -32,6 +32,30 @@
     mkdir -p "$AUTOLAUNCH_DIR"
     mkdir -p "$CONFIG_DIR"
     ln -sf "$DAEMON_SRC" "$SYMLINK_DEST"
+
+    # Install Python dependencies into the iTerm2 runtime if needed.
+    # The iTerm2 Python env lives under ~/Library/Application Support/iTerm2/iterm2env
+    # or ~/.config/iterm2/AppSupport/iterm2env — find whichever pip3 exists.
+    ITERM2_ENV_DIRS=(
+        "$HOME/.config/iterm2/AppSupport/iterm2env"
+        "$HOME/Library/Application Support/iTerm2/iterm2env"
+    )
+    PIP3=""
+    for env_dir in "${ITERM2_ENV_DIRS[@]}"; do
+        # Find the most recent Python version's pip3
+        if [[ -d "$env_dir/versions" ]]; then
+            pip_candidate="$(find "$env_dir/versions" -name pip3 -path "*/bin/pip3" 2>/dev/null | sort -V | tail -1)"
+            if [[ -n "$pip_candidate" && -x "$pip_candidate" ]]; then
+                PIP3="$pip_candidate"
+                break
+            fi
+        fi
+    done
+
+    # If we found pip3, ensure aiohttp is installed
+    if [[ -n "$PIP3" ]]; then
+        "$PIP3" show aiohttp >/dev/null 2>&1 || "$PIP3" install --quiet aiohttp
+    fi
 } 2>/dev/null
 
 exit 0
