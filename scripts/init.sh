@@ -19,23 +19,10 @@
     # Python API not enabled — nothing to do
     [[ -d "$HOME/Library/Application Support/iTerm2/Scripts" ]] || exit 0
 
-    # Already set up and pointing to the right place — fast exit
-    if [[ -L "$SYMLINK_DEST" ]]; then
-        target="$(readlink "$SYMLINK_DEST")"
-        [[ "$target" == "$DAEMON_SRC" ]] && exit 0
-    fi
-
-    # Daemon script must exist — don't create a dangling symlink
-    [[ -f "$DAEMON_SRC" ]] || exit 0
-
-    # Set up: create dirs, place symlink
-    mkdir -p "$AUTOLAUNCH_DIR"
-    mkdir -p "$CONFIG_DIR"
-    ln -sf "$DAEMON_SRC" "$SYMLINK_DEST"
-
     # Install Python dependencies into the iTerm2 runtime if needed.
     # The iTerm2 Python env lives under ~/Library/Application Support/iTerm2/iterm2env
     # or ~/.config/iterm2/AppSupport/iterm2env — find whichever pip3 exists.
+    # This runs before the symlink check so existing installs also get deps.
     ITERM2_ENV_DIRS=(
         "$HOME/.config/iterm2/AppSupport/iterm2env"
         "$HOME/Library/Application Support/iTerm2/iterm2env"
@@ -56,6 +43,20 @@
     if [[ -n "$PIP3" ]]; then
         "$PIP3" show aiohttp >/dev/null 2>&1 || "$PIP3" install --quiet aiohttp
     fi
+
+    # Already set up and pointing to the right place — done
+    if [[ -L "$SYMLINK_DEST" ]]; then
+        target="$(readlink "$SYMLINK_DEST")"
+        [[ "$target" == "$DAEMON_SRC" ]] && exit 0
+    fi
+
+    # Daemon script must exist — don't create a dangling symlink
+    [[ -f "$DAEMON_SRC" ]] || exit 0
+
+    # Set up: create dirs, place symlink
+    mkdir -p "$AUTOLAUNCH_DIR"
+    mkdir -p "$CONFIG_DIR"
+    ln -sf "$DAEMON_SRC" "$SYMLINK_DEST"
 } 2>/dev/null
 
 exit 0
