@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "cc-iterm2-notifier",
-      "source": ".",
+      "source": "./",
       "description": "iTerm2 tab indicators and smart notifications for Claude Code",
       "version": "0.1.0",
       "author": {
