@@ -5,8 +5,6 @@
   "author": {
     "name": "Phil Gambling"
   },
-  "homepage": "https://github.com/pgambling/cc-iterm2-notifier",
-  "repository": "pgambling/cc-iterm2-notifier",
-  "license": "MIT",
-  "keywords": ["iterm2", "notifications", "macos", "tab-indicators"]
+  "repository": "https://github.com/pgambling/cc-iterm2-notifier",
+  "license": "MIT"
 }
